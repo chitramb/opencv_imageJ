@@ -1,12 +1,14 @@
 # Microscopy Image Analysis
 
-A reproducible Python starter pipeline for the supplied Drosophila egg-chamber TIFF images. It preserves source pixel data, inventories TIFF metadata, separates grayscale acquisitions from RGB display composites, creates reviewable segmentation masks, and exports morphometry and fluorescence summaries.
+A reproducible Python pipeline for Drosophila egg-chamber microscopy. It inventories TIFF acquisitions, performs baseline QC, and now includes an annotation-guided hierarchical segmentation workflow for biological compartments.
 
-## Important scientific scope
+## Scientific scope and safeguards
 
-This first implementation is a **baseline workflow**, not a validated biological segmentation model. Otsu/adaptive thresholding and connected components are generic image-processing tools; they cannot reliably infer the oocyte boundary, egg-chamber boundary, or individual border cells in every preparation without user review or annotated training data. All automatically generated masks must be inspected before treating measurements as biological results.
+The hierarchical workflow is deliberately human-in-the-loop. Egg-chamber, oocyte and border-cell search-region polygons are annotated by a user; DAPI nuclei and DE-cadherin-positive structures are then detected only inside the relevant polygon. This prevents a generic threshold from silently assigning biological identities.
 
-RGB/pseudocoloured composites are marked non-quantitative by default. Their RGB values are display colours and must not be treated as original fluorescence intensities. Quantitative fluorescence analysis should use the original grayscale channel acquisitions with matched exposure/gain settings and background correction.
+The automated nuclei and border-cluster masks are candidates, not validated biological truth. Inspect overlays and compare against manual Fiji/ImageJ annotations before reporting counts or areas. The border-cluster algorithm returns the largest connected candidate within a tightly drawn search ROI; it does not identify individual border cells.
+
+RGB/pseudocoloured composites are not treated as quantitative fluorescence sources. Use original single-channel acquisitions for intensity measurements.
 
 ## Install
 
@@ -14,56 +16,78 @@ Python 3.10+ is recommended.
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate          # Windows: .venv\\Scripts\\activate
+source .venv/bin/activate
 pip install -r requirements.txt
 pip install -e .
 ```
 
-## Inventory images
+## Baseline QC
 
 ```bash
 microscopy-pipeline inventory /path/to/tiff_folder --output results/inventory.csv
+microscopy-pipeline batch /path/to/tiff_folder --output results
 ```
 
-## Analyse a folder
+These commands produce generic foreground masks and connected-component QC only. They do not infer egg-chamber or oocyte identities.
 
-```bash
-microscopy-pipeline batch /path/to/tiff_folder --output results --pixel-size-um 0.25
+## Hierarchical compartment segmentation
+
+### 1. Annotate the biological regions
+
+For each image, create a JSON file with three polygons. Coordinates are pixel coordinates in `[x, y]` order:
+
+```json
+{
+  "egg_chamber": [[120, 210], [180, 140], [420, 150], [610, 310], [590, 560], [300, 610], [130, 430]],
+  "oocyte": [[390, 250], [450, 220], [570, 330], [560, 500], [430, 520], [370, 390]],
+  "border_search": [[340, 300], [420, 280], [450, 390], [390, 430]]
+}
 ```
 
-Omit `--pixel-size-um` if calibration is unknown; measurements will remain in pixels and pixels². The example value above is illustrative only and must be replaced with the microscope calibration.
+The coordinates above are illustrative placeholders, **not annotations for the supplied images**. Draw the actual polygons in Fiji/ImageJ or another annotation tool. Use one egg chamber per annotation file. The oocyte and border-search polygons are clipped to the egg-chamber mask.
 
-The batch command writes:
-- `inventory.csv`: file dimensions, dtype, channels, range and TIFF metadata.
-- `measurements.csv`: preliminary image/object measurements.
-- `overlays/`: review images showing detected components.
-- `masks/`: binary masks for the generic foreground segmentation.
+### 2. Run the segmentation functions
 
-## Single image
+```python
+import cv2
+from microscopy_pipeline.hierarchical_segmentation import (
+    build_compartment_masks, mask_metrics, save_segmentation, load_annotations
+)
 
-```bash
-microscopy-pipeline analyse sample.tif --output results/sample --pixel-size-um 0.25
+dapi = cv2.imread("sample_DAPI.tif", cv2.IMREAD_UNCHANGED)
+decad = cv2.imread("sample_DEcad.tif", cv2.IMREAD_UNCHANGED)
+actub = cv2.imread("sample_AcTub.tif", cv2.IMREAD_UNCHANGED)
+
+annotations = load_annotations("sample_annotations.json")
+masks = build_compartment_masks(
+    dapi.shape, annotations, dapi, decad,
+    nuclei_params={"min_area_px": 40, "max_area_px": 6000},
+    border_params={"min_area_px": 20},
+)
+metrics = mask_metrics(masks)
+save_segmentation("results/sample", actub, masks, metrics)
 ```
 
-## Current analysis behaviour
+Use matching fields of view and verify that the DAPI, DEcad and overlay images are registered. The example parameters are starting values and require tuning against manual annotations. If the files are not registered, register them before applying masks across channels.
 
-- Reads TIFF pixel arrays with `tifffile`; never overwrites or rescales source files.
-- Records dtype, shape, finite intensity range and TIFF page metadata.
-- Treats single-channel grayscale images as candidate quantitative acquisitions.
-- Treats RGB/RGBA images as display/composite images and excludes them from quantitative fluorescence calculations by default.
-- Creates a conservative Otsu foreground mask and connected-component measurements for QC and exploration.
-- Reports area, major/minor axis, equivalent diameter, centroid and bounding box.
-- Does **not** automatically assign a component as oocyte, nurse-cell compartment, egg chamber or border-cell cluster.
+### 3. Outputs and metric definitions
 
-## Next validation steps
+- Egg chamber: polygon area and major/minor axis length.
+- Oocyte: polygon area and major/minor axis length.
+- Oocyte nuclei: DAPI-positive object candidates within the oocyte; density = detected object count / oocyte area.
+- Border-cell cluster: DE-cadherin-positive candidate area within the border-search ROI; density = cluster area / egg-chamber area × 100%.
 
-1. Confirm pixel-size calibration and acquisition metadata.
-2. Annotate representative egg-chamber and oocyte boundaries.
-3. Agree on an operational definition of border-cell cluster and density.
-4. Validate masks against manual ImageJ/Fiji measurements.
-5. Add channel-specific fluorescence ROIs and background regions.
-6. Only then lock parameters and compare Control, Par-1 RNAi and Sgg RNAi groups.
+Without pixel calibration, results are in pixels and pixels². Do not convert to micrometres without the acquisition calibration.
+
+## Validation plan
+
+1. Annotate egg chamber, oocyte and border-cell search region for representative images from each condition.
+2. Have the biological boundary definitions checked by the experimenter.
+3. Compare automatic DAPI nuclei detections against manual counts; tune size and watershed parameters.
+4. Compare the border-cluster mask against a manual DEcad mask. A single connected-component heuristic may fail when signal is fragmented or other membranes enter the search ROI.
+5. Quantify boundary overlap (e.g. Dice/IoU), count error and area error on held-out images.
+6. Only after validation, batch-process Control, Par-1 RNAi and Sgg RNAi images.
 
 ## Data handling
 
-Do not commit identifiable, unpublished or sensitive microscopy data to a public repository unless permitted by the relevant project/data policy. Keep raw data outside the repository; commit code and small synthetic test fixtures only.
+Keep raw microscopy data outside the repository unless project/data policy explicitly permits publishing it. Commit code and small synthetic tests, not unpublished raw images.
